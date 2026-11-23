@@ -1,12 +1,29 @@
-"""Nonce guard 的安全契约与桩实现。
+"""Nonce guard 的安全契约与实现。
 
-本文件恰好包含 8 个公开桩。所有桩在修复 README 中的 10 个缺陷前都会抛出
-NotImplementedError。实现只允许使用标准库 hashlib、hmac、collections。
+本文件恰好包含 8 个公开函数，实现 README 中描述的 10 个缺陷的修复。
+实现只允许使用标准库 hashlib、hmac、collections。
 """
-
 import hashlib
 import hmac
-from collections import deque
+
+
+def _key_bytes(key_id: str | bytes) -> bytes:
+    """把密钥标识规范化为非空 bytes。"""
+    if isinstance(key_id, str):
+        raw = key_id.encode("utf-8")
+    elif isinstance(key_id, (bytes, bytearray, memoryview)):
+        raw = bytes(key_id)
+    else:
+        raise ValueError("key_id must be str or bytes")
+    if not raw:
+        raise ValueError("key_id must not be empty")
+    return raw
+
+
+def _positive_int(value, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def counter_next(state: dict) -> int:
@@ -23,7 +40,19 @@ def counter_next(state: dict) -> int:
       不得回绕成负数，也不得回到 0 造成旧值重复。
     - 重复检测为严格相等，容差 0：同一个 state 不得返回已经签发过的值。
     """
-    raise NotImplementedError("counter_next")
+    width = _positive_int(state["width"], "width")
+    last = state.get("last", -1)
+    if not isinstance(last, int) or isinstance(last, bool):
+        raise ValueError("last must be an integer")
+
+    upper = (1 << width) - 1
+    next_value = last + 1
+    # 有符号回绕与回到 0 都会重复旧值；到达上界即失败，不回绕。
+    if next_value > upper:
+        raise OverflowError("counter exhausted")
+
+    state["last"] = next_value
+    return next_value
 
 
 def nonce_for(key_id: str | bytes, counter: int) -> bytes:
@@ -39,7 +68,14 @@ def nonce_for(key_id: str | bytes, counter: int) -> bytes:
       必须得到不同结果。
     - 重复检测按完整字节严格比较，容差 0。
     """
-    raise NotImplementedError("nonce_for")
+    key = _key_bytes(key_id)
+    if not isinstance(counter, int) or isinstance(counter, bool):
+        raise ValueError("counter must be an integer")
+    if counter < 0 or counter > (1 << 64) - 1:
+        raise ValueError("counter out of 64-bit unsigned range")
+
+    message = b"nonce:" + counter.to_bytes(8, "big")
+    return hmac.new(key, message, hashlib.sha256).digest()[:12]
 
 
 def gcm_nonce(key_id: str | bytes, counter: int, fixed: bytes) -> bytes:
@@ -55,7 +91,23 @@ def gcm_nonce(key_id: str | bytes, counter: int, fixed: bytes) -> bytes:
     - key_id 必须非空，用于确认归属；它不能替代固定段，也不改变拼接布局。
     - 重复检测按完整 12 字节严格比较，容差 0。
     """
-    raise NotImplementedError("gcm_nonce")
+    _key_bytes(key_id)
+    if not isinstance(fixed, (bytes, bytearray, memoryview)):
+        raise ValueError("fixed must be bytes-like")
+    fixed = bytes(fixed)
+
+    counter_bytes = 12 - len(fixed)
+    if counter_bytes < 1:
+        # 固定段占满整块会把计数段挤掉。
+        raise ValueError("fixed segment leaves no room for counter")
+
+    if not isinstance(counter, int) or isinstance(counter, bool):
+        raise ValueError("counter must be an integer")
+    # 任何情况下都不得截断计数段。
+    if counter < 0 or counter >= (1 << (8 * counter_bytes)):
+        raise OverflowError("counter does not fit in counter segment")
+
+    return fixed + counter.to_bytes(counter_bytes, "big")
 
 
 def record_use(seen: dict, key_id: str | bytes, nonce: bytes) -> dict:
@@ -77,7 +129,49 @@ def record_use(seen: dict, key_id: str | bytes, nonce: bytes) -> dict:
     - 先查询再追加；追加后若超过 limit，从最旧记录开始清理，保证内存有界。
     - 本函数不签发计数器；计数器宽度由 counter_next 的 state 负责。
     """
-    raise NotImplementedError("record_use")
+    if not isinstance(seen, dict):
+        raise ValueError("seen must be a dict")
+    uses = seen.get("uses")
+    if not isinstance(uses, list):
+        raise ValueError("seen['uses'] must be a list")
+    limit = _positive_int(seen.get("limit"), "limit")
+    evicted = seen.get("evicted", 0)
+    if isinstance(evicted, bool) or not isinstance(evicted, int) or evicted < 0:
+        raise ValueError("evicted must be a non-negative integer")
+
+    key = _key_bytes(key_id)
+    if not isinstance(nonce, (bytes, bytearray, memoryview)):
+        raise ValueError("nonce must be bytes-like")
+    nonce = bytes(nonce)
+
+    # 比较键是 key_id 与 nonce 的组合；只比较 nonce 会把跨密钥误判为重复。
+    position = None
+    count = 1
+    for index, record in enumerate(uses):
+        try:
+            same_key = _key_bytes(record["key_id"]) == key
+        except (KeyError, ValueError):
+            same_key = False
+        same_nonce = bytes(record["nonce"]) == nonce if "nonce" in record else False
+        if same_key and same_nonce:
+            if position is None:
+                position = index
+            count += 1
+
+    uses.append({"key_id": key_id, "nonce": nonce})
+
+    # 追加后从最旧记录开始清理，内存有界。
+    while len(uses) > limit:
+        uses.pop(0)
+        evicted += 1
+    seen["evicted"] = evicted
+
+    return {
+        "duplicate": position is not None,
+        "position": position,
+        "count": count,
+        "evicted": evicted,
+    }
 
 
 def detect_reuse(records: list[dict]) -> list[dict]:
@@ -97,7 +191,73 @@ def detect_reuse(records: list[dict]) -> list[dict]:
       common_prefix；kind 只能是 exact 或 near。
     - 记录为空或没有重用返回空列表。
     """
-    raise NotImplementedError("detect_reuse")
+    if not isinstance(records, list):
+        raise ValueError("records must be a list")
+
+    normalized = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise ValueError("each record must be a dict")
+        normalized.append(
+            (_key_bytes(record["key_id"]), bytes(record["nonce"]))
+        )
+
+    findings = []
+    for position, (key, nonce) in enumerate(normalized):
+        exact_first = None
+        best_near_first = None
+        best_near_prefix = 0
+
+        for first in range(position):
+            prior_key, prior_nonce = normalized[first]
+            if prior_key != key:
+                continue
+
+            if prior_nonce == nonce:
+                # 完整相等优先；取最早命中位置。
+                if exact_first is None:
+                    exact_first = first
+                continue
+
+            prefix = _common_prefix_len(nonce, prior_nonce)
+            if prefix < 1:
+                continue
+            # 最长 near 优先，并列时取最早位置。
+            if prefix > best_near_prefix:
+                best_near_prefix = prefix
+                best_near_first = first
+
+        if exact_first is not None:
+            findings.append(
+                {
+                    "key_id": records[position]["key_id"],
+                    "position": position,
+                    "first_position": exact_first,
+                    "kind": "exact",
+                    "common_prefix": len(nonce),
+                }
+            )
+        elif best_near_first is not None:
+            findings.append(
+                {
+                    "key_id": records[position]["key_id"],
+                    "position": position,
+                    "first_position": best_near_first,
+                    "kind": "near",
+                    "common_prefix": best_near_prefix,
+                }
+            )
+
+    return findings
+
+
+def _common_prefix_len(a: bytes, b: bytes) -> int:
+    """从第 0 字节起逐字节比较，返回严格公共前缀长度。"""
+    limit = min(len(a), len(b))
+    for index in range(limit):
+        if a[index] != b[index]:
+            return index
+    return limit
 
 
 def ciphertext_overlap(a: bytes, b: bytes) -> int:
@@ -110,7 +270,11 @@ def ciphertext_overlap(a: bytes, b: bytes) -> int:
     - 一方是另一方前缀时返回较短长度。
     - 容差 0：不能使用异或求和等聚合技巧，位置不同的相同字节不计入重叠。
     """
-    raise NotImplementedError("ciphertext_overlap")
+    if not isinstance(a, (bytes, bytearray, memoryview)):
+        raise ValueError("a must be bytes-like")
+    if not isinstance(b, (bytes, bytearray, memoryview)):
+        raise ValueError("b must be bytes-like")
+    return _common_prefix_len(bytes(a), bytes(b))
 
 
 def validate_policy(policy: dict) -> list[str]:
@@ -129,7 +293,41 @@ def validate_policy(policy: dict) -> list[str]:
       空列表。问题判定容差 0，不忽略任何一项。
     - 非字典或缺少字段时抛 ValueError。
     """
-    raise NotImplementedError("validate_policy")
+    if not isinstance(policy, dict):
+        raise ValueError("policy must be a dict")
+
+    required = ("counter_bits", "nonce_bytes", "fixed_bytes", "reuse_detection")
+    for field in required:
+        if field not in policy:
+            raise ValueError(f"policy missing field: {field}")
+
+    counter_bits = policy["counter_bits"]
+    nonce_bytes = policy["nonce_bytes"]
+    fixed_bytes = policy["fixed_bytes"]
+    for name, value in (
+        ("counter_bits", counter_bits),
+        ("nonce_bytes", nonce_bytes),
+        ("fixed_bytes", fixed_bytes),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} must be an integer")
+    if counter_bits <= 0 or nonce_bytes <= 0 or fixed_bytes < 0:
+        raise ValueError("policy numeric fields out of range")
+
+    problems = []
+
+    # 顺序固定：计数器宽度、固定段长度、重复检测开关。
+    if counter_bits < 64:
+        problems.append("counter_width_too_small")
+
+    counter_bytes = -(-counter_bits // 8)  # ceil(counter_bits / 8)
+    if fixed_bytes > nonce_bytes - counter_bytes:
+        problems.append("fixed_segment_too_long")
+
+    if policy["reuse_detection"] is not True:
+        problems.append("reuse_detection_disabled")
+
+    return problems
 
 
 def nonce_batch(keys: list[str | bytes], policy: dict) -> dict:
@@ -149,4 +347,41 @@ def nonce_batch(keys: list[str | bytes], policy: dict) -> dict:
     - 函数不保留模块级状态；相同参数重复调用必须得到相同结果。
     - 重复检测按完整字节严格比较，容差 0。
     """
-    raise NotImplementedError("nonce_batch")
+    if not isinstance(policy, dict):
+        raise ValueError("policy must be a dict")
+    if "batch_size" not in policy:
+        raise ValueError("policy missing field: batch_size")
+    batch_size = _positive_int(policy["batch_size"], "batch_size")
+
+    # 先校验策略；错误码直接进入异常信息。
+    problems = validate_policy(policy)
+    if problems:
+        raise ValueError("invalid policy: " + ", ".join(problems))
+
+    if policy["nonce_bytes"] != 12:
+        raise ValueError("nonce_bytes must be 12 for GCM nonces")
+
+    if not isinstance(keys, (list, tuple)):
+        raise ValueError("keys must be a sequence")
+    normalized_keys = [_key_bytes(key_id) for key_id in keys]
+    if len(set(normalized_keys)) != len(normalized_keys):
+        raise ValueError("keys must not contain duplicates")
+
+    fixed_bytes = policy["fixed_bytes"]
+    counter_bits = policy["counter_bits"]
+
+    result = {}
+    for key_id, key in zip(keys, normalized_keys):
+        # 每个密钥拥有独立的计数器状态，始终从 0 开始。
+        state = {"last": -1, "width": counter_bits}
+        fixed = hmac.new(
+            key, b"fixed:" + key, hashlib.sha256
+        ).digest()[:fixed_bytes]
+
+        nonces = []
+        for _ in range(batch_size):
+            counter = counter_next(state)
+            nonces.append(gcm_nonce(key_id, counter, fixed))
+        result[key_id] = nonces
+
+    return result
